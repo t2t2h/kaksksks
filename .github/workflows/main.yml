@@ -1,0 +1,89 @@
+name: Build dylib + inject into IPA
+
+# التشغيل:
+#  • عند كل push: يبني الـ dylib فقط (تجده في Artifacts).
+#  • يدوياً (Run workflow) مع ipa_url: يبني الـ dylib ثم يحقنه في الـ IPA وينشره في Releases باسم latest-build.
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "رابط مباشر لملف Swiftgram .ipa (مثلاً رابط Release asset). اتركه فارغاً لبناء الـ dylib فقط"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # لنشر الناتج في Releases
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: brew install ldid make dpkg
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Install iOS SDK
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
+          cd /tmp/sdks && git sparse-checkout set iPhoneOS16.5.sdk
+          cp -R /tmp/sdks/*.sdk $THEOS/sdks/
+
+      - name: Build dylib
+        run: |
+          MK=$(find . -maxdepth 2 -name Makefile -not -path "./.theos/*" | head -1)
+          cd "$(dirname "$MK")"
+          echo "BUILD_DIR=$(pwd)" >> $GITHUB_ENV
+          $(brew --prefix make)/bin/gmake clean || true
+          $(brew --prefix make)/bin/gmake FINALPACKAGE=1
+
+      - name: Collect dylib
+        run: |
+          mkdir -p out
+          find "$BUILD_DIR/.theos/obj" -name "*.dylib" -exec cp {} out/ \;
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AflatoonSuite-dylib
+          path: out/*.dylib
+
+      # ───── الحقن في الـ IPA (يعمل فقط لو أدخلت ipa_url) ─────
+      - name: Download IPA
+        if: ${{ inputs.ipa_url != '' }}
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
+        run: |
+          curl -L --fail --retry 3 -o input.ipa "$IPA_URL"
+          ls -la input.ipa
+
+      - uses: actions/setup-python@v5
+        if: ${{ inputs.ipa_url != '' }}
+        with:
+          python-version: "3.12"
+
+      - name: Install cyan (pyzule-rw)
+        if: ${{ inputs.ipa_url != '' }}
+        run: pip install --force-reinstall https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+
+      - name: Inject dylib into IPA
+        if: ${{ inputs.ipa_url != '' }}
+        run: |
+          DYLIB=$(ls out/*.dylib | head -1)
+          cyan -i input.ipa -o AflatoonSuite-patched.ipa -f "$DYLIB"
+          ls -la AflatoonSuite-patched.ipa
+
+      - name: Publish to Release (latest-build)
+        if: ${{ inputs.ipa_url != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest-build --yes --cleanup-tag || true
+          gh release create latest-build AflatoonSuite-patched.ipa out/*.dylib \
+            --title "Latest build" --notes "IPA patched with AflatoonSuite" --prerelease
